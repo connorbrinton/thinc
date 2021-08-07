@@ -1,11 +1,11 @@
-from typing import Dict, List
+from typing import Dict, List, cast
 import itertools
 from mypy.errors import Errors
 from mypy.errorcodes import ErrorCode
 from mypy.options import Options
 from mypy.plugin import FunctionContext, Plugin, CheckerPluginInterface
-from mypy.types import Instance, Type, CallableType, TypeVarType
-from mypy.nodes import Expression, CallExpr, NameExpr, FuncDef, Decorator, MypyFile
+from mypy.types import Instance, Type, CallableType, TypeVarType, get_proper_type
+from mypy.nodes import ARG_POS, ARG_STAR, Expression, CallExpr, NameExpr, FuncDef, Decorator, MypyFile
 from mypy.checker import TypeChecker
 from mypy.subtypes import is_subtype
 
@@ -108,67 +108,92 @@ def get_reducers_type(ctx: FunctionContext) -> Type:
     assert isinstance(ctx.context.callee, NameExpr)
     assert isinstance(ctx.context.callee.node, (FuncDef, Decorator))
     assert isinstance(ctx.context.callee.node.type, CallableType)
-    assert isinstance(ctx.context.callee.node.type.ret_type, Instance)
-    assert ctx.context.callee.node.type.ret_type.args
-    assert len(ctx.context.callee.node.type.ret_type.args) == 2
+
+    # Verify that the function returns a `Model`
+    # TODO: Use `map_instance_to_supertype` to map subtypes to `Model`s.
+    # I haven't implemented this myself because I wasn't able to figure out
+    # how to look up the `TypeInfo` for a class outside of the module being
+    # type-checked
+    callee_type = ctx.context.callee.node.type
+    return_type = get_proper_type(callee_type.ret_type)
+    assert isinstance(return_type, Instance)
+    assert return_type.type.fullname == thinc_model_fullname
+    assert return_type.args
+    assert len(return_type.args) == 2
 
     # Obtain the output type parameter of the `thinc.model.Model` return type
     # of the called API function
-    out_type = ctx.context.callee.node.type.ret_type.args[1]
+    out_type = return_type.args[1]
 
     # Check if the `Model`'s output type parameter is one of the "special
     # type variables" defined to represent model composition (chaining) and
     # homogenous reduction
     assert isinstance(out_type, TypeVarType)
-    assert out_type.fullname
-    if out_type.fullname not in {intoin_outtoout_out_fullname, chained_out_fullname}:
-        return ctx.default_return_type
+    assert out_type.fullname in {intoin_outtoout_out_fullname, chained_out_fullname}
 
-    # Extract type of each argument used to call the API function
+    # Make sure that each formal argument has at most one candidate actual argument that is not
+    # a candidate to fill any other formal argument
+    assert all(len(actual_args) <= 1 for actual_args in ctx.args)
     args = list(itertools.chain(*ctx.args))
-    arg_types = []
-    for arg_type in itertools.chain(*ctx.arg_types):
-        assert isinstance(arg_type, Instance)
-        arg_types.append(arg_type)
+    arg_types = list(itertools.chain(*ctx.arg_types))
+    assert len(set(args)) == len(args)
 
-    # Collect neighboring pairs of arguments and their types
-    arg_pairs = list(zip(args[:-1], args[1:]))
-    arg_types_pairs = list(zip(arg_types[:-1], arg_types[1:]))
+    # Map argument types to proper types (resolve type aliases, etc.) and
+    # verify that all arguments are of the type `Model[InT, OutT]`
+    proper_arg_types = [get_proper_type(arg_type) for arg_type in arg_types]
+    assert all(isinstance(arg_type, Instance) for arg_type in proper_arg_types)
+    proper_arg_types: List[Instance] = cast(List[Instance], proper_arg_types)
+    assert all(arg_type.type.fullname == thinc_model_fullname for arg_type in proper_arg_types)
+    assert all(len(arg_type.args) == 2 for arg_type in proper_arg_types)
 
-    # Determine if passed models will be chained or if they all need to have
-    # the same input and output type
+    # If models will be chained/composed, verify that all variadic arguments
+    # (*args) have an idempotent `Model` type
+    # If this is not the case, we'll need to return the default return type
+    # This ensures that the number of values passed to variadic arguments
+    # doesn't affect the type of the produced model
+    # Here we need to look up the kinds of formal arguments of the *called
+    # function*, since we're interested in the sequence of called function
+    # arguments, and not how they were passed to the function
     if out_type.fullname == chained_out_fullname:
-        # Models will be chained, meaning that the output of each model will
-        # be passed as the input to the next model
-        # Verify that model inputs and outputs are compatible
-        for (arg1, arg2), (type1, type2) in zip(arg_pairs, arg_types_pairs):
-            assert isinstance(type1, Instance)
-            assert isinstance(type2, Instance)
-            assert type1.type.fullname == thinc_model_fullname
-            assert type2.type.fullname == thinc_model_fullname
-            check_chained(
-                l1_arg=arg1, l1_type=type1, l2_arg=arg2, l2_type=type2, api=ctx.api
-            )
+        for arg_type, arg_kind in zip(proper_arg_types, callee_type.arg_kinds):
+            if arg_kind == ARG_STAR:
+                assert is_subtype(arg_type.args[1], arg_type.args[0])
 
+    # Choose function to use for pairwise `Model` argument compatibility tests
+    if out_type.fullname == chained_out_fullname:
+        check_pairwise = check_chained
+    elif out_type.fullname == intoin_outtoout_out_fullname:
+        check_pairwise = check_intoin_outtoout
+    else:
+        assert False, "Thinc mypy plugin error: output type name invalid"
+
+    # Iterate over arguments and verify pairwise compatibility
+    zipped_args_and_types = list(zip(args, proper_arg_types))
+    arg_pairs = zip(zipped_args_and_types[:-1], zipped_args_and_types[1:])
+    for left_arg_and_type, right_arg_and_type in arg_pairs:
+        # Expand argument information
+        left_arg, left_arg_type = left_arg_and_type
+        right_arg, right_arg_type = right_arg_and_type
+
+        # Check their pairwise interaction
+        check_pairwise(
+            l1_arg=left_arg,
+            l1_type=left_arg_type,
+            l2_arg=right_arg,
+            l2_type=right_arg_type,
+            api=ctx.api,
+        )
+
+    # Build and return combined model type
+    if out_type.fullname == chained_out_fullname:
         # Generated model takes the first model's input and returns the last model's output
         return Instance(
-            ctx.default_return_type.type, [arg_types[0].args[0], arg_types[-1].args[1]]
+            ctx.default_return_type.type, [proper_arg_types[0].args[0], proper_arg_types[-1].args[1]]
         )
     elif out_type.fullname == intoin_outtoout_out_fullname:
-        # Models must have the same input and output types
-        # Verify that model inputs and outputs are compatible
-        for (arg1, arg2), (type1, type2) in zip(arg_pairs, arg_types_pairs):
-            assert isinstance(type1, Instance)
-            assert isinstance(type2, Instance)
-            assert type1.type.fullname == thinc_model_fullname
-            assert type2.type.fullname == thinc_model_fullname
-            check_intoin_outtoout(
-                l1_arg=arg1, l1_type=type1, l2_arg=arg2, l2_type=type2, api=ctx.api
-            )
-
         # Generated model accepts and returns the same types as all passed models
         return Instance(
-            ctx.default_return_type.type, [arg_types[0].args[0], arg_types[0].args[1]]
+            ctx.default_return_type.type, [proper_arg_types[0].args[0], proper_arg_types[0].args[1]]
         )
 
     # Make sure the default return type is returned if no branch was selected
